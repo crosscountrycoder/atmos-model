@@ -1,4 +1,4 @@
-"""Mole fractions of CO2, CH4, N2O, H2, Ne, Kr, and Xe at 1 km increments
+"""Mole fractions of CO2, CH4, N2O, H2, O3, Ne, Kr, and Xe at 1 km increments
 from 0 to 1000 km.
 
 CO2, CH4, N2O, and H2 all use real WACCM-X output: the altitude-dependent
@@ -13,6 +13,15 @@ equilibrium formula -- that was tried for H2 and rejected: diffusive
 equilibrium assumes zero net vertical flux, which is wrong for a species
 this light (close to atomic H's mass, so real Jeans escape matters), and it
 produced an even less physical number than just holding WACCM's last value.
+
+O3 uses real WACCM-X output too, but as an absolute mole fraction rather
+than a ratio-to-surface: ozone isn't well-mixed, so there's no stable
+"current sea-level value" to anchor a ratio to the way there is for
+CO2/CH4/N2O/H2 (surface O3 is a noisy, location-dependent trace amount, not
+a global constant). Above WACCM-X's grid top it's set to exactly 0 rather
+than held flat, since by ~500 km real O3 is already many orders of
+magnitude below anything physically meaningful (see the stratospheric peak
+vs. thermospheric value in the module's own output).
 
 Ne/Kr/Xe (WACCM doesn't track noble gases -- they're chemically inert, so
 there's nothing for it to model, and pure diffusion is already the
@@ -39,11 +48,16 @@ WACCM_BASE_URL = (
     "atm/cam.h0/f.e20.FXSD.f19_f19.001.cam.h0.{month}.nc"
 )
 WACCM_MONTHS = ["2016-06", "2016-12"]
-WACCM_GASES = ["H2", "CO2", "CH4", "N2O"]
+# Scaled to a current NOAA sea-level value via ratio-to-surface.
+WACCM_RATIO_GASES = ["H2", "CO2", "CH4", "N2O"]
+# Used as WACCM's absolute mole fraction -- no stable sea-level value to
+# scale a ratio against (see module docstring).
+WACCM_ABSOLUTE_GASES = ["O3"]
+WACCM_GASES = WACCM_RATIO_GASES + WACCM_ABSOLUTE_GASES
 
 # Current (2025-2026) well-mixed sea-level mole fractions.
 SEA_LEVEL_MOLE_FRACTIONS = {
-    "CO2": 4.260e-4,
+    "CO2": 4.290e-4,
     "CH4": 1.936e-6,
     "N2O": 3.390e-7,
     "H2": 5.530e-7,
@@ -51,6 +65,9 @@ SEA_LEVEL_MOLE_FRACTIONS = {
     "Kr": 1.140e-6,
     "Xe": 8.700e-8,
 }
+
+# All gases this script writes to waccm_gases.csv, in output-column order.
+ALL_GASES = list(SEA_LEVEL_MOLE_FRACTIONS) + WACCM_ABSOLUTE_GASES
 
 HOMOPAUSE_ALT = 86000  # m
 G0 = 9.80665            # standard gravity at sea level, m/s^2
@@ -123,12 +140,14 @@ def gravity(z):
 
 
 # ---------------------------------------------------------------------------
-# WACCM-X: real ratio-to-surface profiles for H2, CO2, CH4, N2O
+# WACCM-X: real ratio-to-surface profiles for H2/CO2/CH4/N2O, and the real
+# absolute profile for O3
 # ---------------------------------------------------------------------------
 
-def fetch_waccm_ratio_profiles():
-    """{gas: (altitudes_m, ratio_to_surface)} averaged over WACCM_MONTHS,
-    at LATITUDE, zonal (longitude) mean.
+def fetch_waccm_profiles():
+    """{gas: (altitudes_m, values)} averaged over WACCM_MONTHS, at LATITUDE,
+    zonal (longitude) mean. Values are ratio-to-surface for WACCM_RATIO_GASES,
+    and the raw mol/mol mole fraction for WACCM_ABSOLUTE_GASES.
     """
     per_month = {gas: [] for gas in WACCM_GASES}
     z_per_month = []
@@ -141,16 +160,18 @@ def fetch_waccm_ratio_profiles():
         for gas in WACCM_GASES:
             vals = ds[gas].isel(time=0).sel(lat=LATITUDE, method="nearest").mean(dim="lon").values
             vals = vals[order]
-            per_month[gas].append(vals / vals[0])  # ratio to surface
+            if gas in WACCM_RATIO_GASES:
+                vals = vals / vals[0]  # ratio to surface
+            per_month[gas].append(vals)
 
     # Average the two months on a common altitude grid (June's grid).
     z_ref = z_per_month[0]
     profiles = {}
     for gas in WACCM_GASES:
-        ratios_interp = [
+        vals_interp = [
             np.interp(z_ref, z_per_month[i], per_month[gas][i]) for i in range(len(WACCM_MONTHS))
         ]
-        profiles[gas] = (z_ref, np.mean(ratios_interp, axis=0))
+        profiles[gas] = (z_ref, np.mean(vals_interp, axis=0))
     return profiles
 
 
@@ -194,25 +215,30 @@ def diffusive_equilibrium_mole_fraction(molar_mass_g_mol, sea_level_fraction,
 
 
 # ---------------------------------------------------------------------------
-# Assemble mole fractions for all 7 gases on the output grid
+# Assemble mole fractions for all 8 gases on the output grid
 # ---------------------------------------------------------------------------
 
 def compute_mole_fractions():
     result = {}
-    waccm_profiles = fetch_waccm_ratio_profiles()
+    waccm_profiles = fetch_waccm_profiles()
 
-    for gas in WACCM_GASES:  # CO2, CH4, N2O, H2
+    for gas in WACCM_RATIO_GASES:  # CO2, CH4, N2O, H2
         z, ratio = waccm_profiles[gas]
         fraction = SEA_LEVEL_MOLE_FRACTIONS[gas] * ratio
         result[gas] = np.interp(output_altitudes_m, z, fraction)
 
-    # CO2, CH4, N2O are already below 1e-9 by WACCM-X's own grid top (~500 km,
-    # taken from the data itself rather than hardcoded), in an environment
-    # that's already a near-vacuum -- treat them as zero above that altitude
-    # rather than holding flat at a statistically meaningless value. H2 is
-    # deliberately left flat (see module docstring for why).
+    for gas in WACCM_ABSOLUTE_GASES:  # O3
+        z, fraction = waccm_profiles[gas]
+        result[gas] = np.interp(output_altitudes_m, z, fraction)
+
+    # CO2, CH4, N2O, and O3 are already below 1e-9 (O3 far below that) by
+    # WACCM-X's own grid top (~500 km, taken from the data itself rather than
+    # hardcoded), in an environment that's already a near-vacuum -- treat
+    # them as zero above that altitude rather than holding flat at a
+    # statistically meaningless value. H2 is deliberately left flat (see
+    # module docstring for why).
     waccm_grid_top = waccm_profiles["CO2"][0][-1]
-    for gas in ["CO2", "CH4", "N2O"]:
+    for gas in ["CO2", "CH4", "N2O"] + WACCM_ABSOLUTE_GASES:
         result[gas][output_altitudes_m > waccm_grid_top] = 0.0
 
     for gas in ["Ne", "Kr", "Xe"]:
@@ -231,7 +257,7 @@ def compute_mole_fractions():
 
 
 def write_csv(filename, mole_fractions):
-    gases = list(SEA_LEVEL_MOLE_FRACTIONS)
+    gases = ALL_GASES
     with open(filename, "w") as f:
         f.write("altitude," + ",".join(gases) + "\n")
         for i, alt_m in enumerate(output_altitudes_m):
@@ -243,7 +269,7 @@ if __name__ == "__main__":
     mole_fractions = compute_mole_fractions()
     write_csv(OUTPUT_CSV, mole_fractions)
 
-    gases = list(SEA_LEVEL_MOLE_FRACTIONS)
+    gases = ALL_GASES
     print(f"{'alt(km)':>8} " + " ".join(f"{g:>12}" for g in gases))
     for i, alt_m in enumerate(output_altitudes_m):
         if alt_m % 100000 == 0:
